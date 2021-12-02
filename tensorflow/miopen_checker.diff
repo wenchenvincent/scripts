@@ -1,0 +1,225 @@
+diff --git a/tensorflow/stream_executor/rocm/rocm_dnn.cc b/tensorflow/stream_executor/rocm/rocm_dnn.cc
+index 6dc741b83f7..a93fca4646d 100644
+--- a/tensorflow/stream_executor/rocm/rocm_dnn.cc
++++ b/tensorflow/stream_executor/rocm/rocm_dnn.cc
+@@ -2999,6 +2999,10 @@ port::Status MIOpenSupport::DoPrepareForConvolution(
+   return port::Status::OK();
+ }
+ 
++extern void test_numerics(void* stream, const void* p, int n, int* results);
++
++std::mutex g_dump_mutex;
++
+ port::Status MIOpenSupport::DoConvolve(
+     dnn::ConvolutionKind kind, dnn::DataType element_type,
+     dnn::DataType output_type, Stream* stream,
+@@ -3041,9 +3045,47 @@ port::Status MIOpenSupport::DoConvolve(
+     }
+   }
+ 
++  hipStream_t hs = (hipStream_t)AsGpuStreamValue(stream);
++
+   miopenStatus_t status = miopenStatusSuccess;
+   switch (kind) {
+     case dnn::ConvolutionKind::FORWARD: {
++
++
++      if(element_type == dnn::DataType::kHalf) {
++//        hipDeviceSynchronize();
++        int results[4];
++        int Cin = filter_descriptor.input_feature_map_count();
++        int Cout = filter_descriptor.output_feature_map_count();
++        int fh = filter_descriptor.input_filter_height();
++        int fw = filter_descriptor.input_filter_width();
++        int nFilterElem = Cin * Cout * fw * fh;
++
++        test_numerics(hs, input_data.opaque(), input_descriptor.ElementCount(), results);
++        hipStreamSynchronize(hs);
++        if(results[0] || results[1]) {
++          printf("Convolution input numerics fail: %d, %d / %d (%d)\n", results[0], results[1], input_descriptor.ElementCount(), results[2]);
++          fflush(stdout);
++          if(results[2]>=0 && results[2]<input_descriptor.ElementCount()) {
++            const Eigen::half* px = (const Eigen::half*)(input_data.opaque());
++            printf("%x = %f\n", *(const short*)px, (float)px[0]);
++            fflush(stdout);
++          }
++        }
++//        hipStreamSynchronize(hs);
++        test_numerics(hs, filter_data.opaque(), nFilterElem, results);
++        hipStreamSynchronize(hs);
++        if(results[0] || results[1]) {
++          printf("Convolution filter numerics fail: %d, %d / %d (%d)\n", results[0], results[1], nFilterElem, results[2]);
++          fflush(stdout);
++          if(results[2]>=0 && results[2]<nFilterElem) {
++            const Eigen::half* px = (const Eigen::half*)(filter_data.opaque());
++            printf("%x = %f\n", *(const short*)px, (float)px[0]);
++            fflush(stdout);
++          }
++        }
++      }
++
+       if (use_immediate_mode_) {
+         status = wrap::miopenConvolutionForwardImmediate(
+             miopen.handle(), filter.handle(), filter_data.opaque(),
+@@ -3059,6 +3101,61 @@ port::Status MIOpenSupport::DoConvolve(
+             &beta, output_nd.handle(), output_data.opaque(),
+             scratch_memory.opaque(), scratch_memory.size());
+       }
++      if(element_type == dnn::DataType::kHalf) {
++//        hipStreamSynchronize(hs);
++//        hipDeviceSynchronize();
++        int results[4];
++
++        test_numerics(hs, output_data.opaque(), output_descriptor.ElementCount(), results);
++        hipStreamSynchronize(hs);
++        if(results[0] || results[1]) {
++          printf("Convolution output numerics fail: %d, %d / %d (%d)\n", results[0], results[1], output_descriptor.ElementCount(), results[2]);
++          fflush(stdout);
++          if(results[2]>=0 && results[2]<output_descriptor.ElementCount()) {
++            const Eigen::half* px = (const Eigen::half*)(output_data.opaque());
++            printf("%x = %f\n", *(const short*)px, (float)px[0]);
++            fflush(stdout);
++            g_dump_mutex.lock();
++            FILE* f=fopen("dump_input.txt","w");
++            std::vector<Eigen::half> p;
++            p.resize(input_descriptor.ElementCount());
++            hipMemcpyAsync(&p[0], input_data.opaque(), p.size()*2, hipMemcpyDeviceToHost, hs);
++//hipDeviceSynchronize();
++            hipStreamSynchronize(hs);
++//            Eigen::half* p = (Eigen::half*) input_data.opaque();
++ for(int i=0; i<p.size(); i++)
++   fprintf(f, "%d  %x = %f\n", i, *(short*)&p[i], float(p[i])); 
++  fclose(f);
++        int Cin = filter_descriptor.input_feature_map_count();
++        int Cout = filter_descriptor.output_feature_map_count();
++        int fh = filter_descriptor.input_filter_height();
++        int fw = filter_descriptor.input_filter_width();
++        int nFilterElem = Cin * Cout * fw * fh;
++            f=fopen("dump_filter.txt","w");
++p.resize(nFilterElem);
++hipMemcpyAsync(&p[0], filter_data.opaque(), p.size()*2, hipMemcpyDeviceToHost, hs);
++//hipDeviceSynchronize();
++        hipStreamSynchronize(hs);
++//             p = (Eigen::half*) filter_data.opaque();
++ for(int i=0; i<p.size(); i++)
++   fprintf(f, "%d  %x = %f\n", i, *(short*)&p[i], float(p[i])); 
++  fclose(f);
++            f=fopen("dump_output.txt","w");
++//             p = (Eigen::half*) output_data.opaque();
++p.resize(output_descriptor.ElementCount());
++hipMemcpyAsync(&p[0], output_data.opaque(), p.size()*2, hipMemcpyDeviceToHost, hs);
++//hipDeviceSynchronize();
++        hipStreamSynchronize(hs);
++ for(int i=0; i<p.size(); i++)
++   fprintf(f, "%d  %x = %f\n", i, *(short*)&p[i], float(p[i])); 
++  fclose(f);
++exit(-1);
++
++
++          }
++        }
++      }
++
+ 
+       break;
+     }
+@@ -3639,6 +3736,22 @@ bool MIOpenSupport::DoBatchNormalizationForwardImpl(
+   miopenBatchNormMode_t mode = miopenBNSpatial;
+   float one = 1.0;
+   float zero = 0.0;
++  hipStream_t hs = (hipStream_t)AsGpuStreamValue(stream);
++  if(std::is_same<T, Eigen::half>::value) {
++//    hipDeviceSynchronize();
++    int results[4];
++    test_numerics(hs, x.opaque(), x_desc.ElementCount(), results);
++    hipStreamSynchronize(hs);
++    if(results[0] || results[1]) {
++      printf("Batch normalization input numerics fail: %d, %d / %d (%d)\n", results[0], results[1], x_desc.ElementCount(), results[2]);
++      fflush(stdout);
++      if(results[2]>=0 && results[2]<x_desc.ElementCount()) {
++        const Eigen::half* px = (const Eigen::half*)(x.opaque());
++        printf("%x = %f\n", *(const short*)px, (float)px[0]);
++        fflush(stdout);
++      }
++    }
++  }
+ 
+   auto status = miopenStatusInvalidValue;
+   if (is_training) {
+@@ -3648,6 +3761,7 @@ bool MIOpenSupport::DoBatchNormalizationForwardImpl(
+         const_cast<void*>(scale.opaque()), const_cast<void*>(offset.opaque()),
+         exponential_average_factor, batch_mean->opaque(), batch_var->opaque(),
+         epsilon, saved_mean->opaque(), saved_inv_var->opaque());
++//   printf("Epsilon %f, 
+   } else {
+     const void* maybe_inv_var = estimated_variance.opaque();
+     status = wrap::miopenBatchNormalizationForwardInference(
+@@ -3657,6 +3771,25 @@ bool MIOpenSupport::DoBatchNormalizationForwardImpl(
+         const_cast<void*>(estimated_mean.opaque()),
+         const_cast<void*>(maybe_inv_var), epsilon);
+   }
++
++
++  if(std::is_same<T, Eigen::half>::value) {
++//    hipDeviceSynchronize();
++    int results[4];
++    test_numerics(hs, y->opaque(), x_desc.ElementCount(), results);
++    hipStreamSynchronize(hs);
++    if(results[0] || results[1]) {
++      printf("Batch normalization output numerics fail: %d, %d / %d (%d)\n", results[0], results[1], x_desc.ElementCount(), results[2]);
++      printf("Epsilon %f, exp_factor %f\n", epsilon, exponential_average_factor);
++      fflush(stdout);
++      if(results[2]>=0 && results[2]<x_desc.ElementCount()) {
++        const Eigen::half* px = (const Eigen::half*)(y->opaque());
++        printf("%x = %f\n", *(const short*)px, (float)px[0]);
++        fflush(stdout);
++      }
++    }
++  }
++
+   if (status != miopenStatusSuccess) {
+     LOG(ERROR) << "failed to enqueue forward batch normalization on stream: "
+                << ToString(status);
+diff --git a/tensorflow/stream_executor/rocm/rocm_helpers.cu.cc b/tensorflow/stream_executor/rocm/rocm_helpers.cu.cc
+index b8f119943c2..e883cacd7f2 100644
+--- a/tensorflow/stream_executor/rocm/rocm_helpers.cu.cc
++++ b/tensorflow/stream_executor/rocm/rocm_helpers.cu.cc
+@@ -1,4 +1,5 @@
+ #include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
+ #include <limits>
+ namespace stream_executor {
+ namespace gpu {
+@@ -25,6 +26,32 @@ __global__ void broadcast_fp32_kernel(float* dst, int dst_stride, int batches,
+   }
+ }
+ 
++__global__ void numeric_test_kernel(const half* p, int n, int* results) {
++   int i = threadIdx.x + blockIdx.x*blockDim.x;
++   if(i>=n)
++      return;
++   if(__hisinf(p[i])) {
++      atomicAdd(&results[0], 1);
++      results[2]=i;
++    }
++    if(__hisnan(p[i])) {
++      atomicAdd(&results[1], 1);
++      results[2]=i;
++   }
++}
++
++void test_numerics(void* stream, const void* p, int n, int* results) {
++  int* pres;
++  hipStream_t hs = (hipStream_t)stream;
++  hipMalloc(&pres, 16);
++  hipMemsetAsync(pres, 0, 16, hs);
++  int x_blocks = (n+255)/256;
++  hipLaunchKernelGGL(numeric_test_kernel, dim3(x_blocks, 1, 1), 256, 0, (hipStream_t)stream, reinterpret_cast<const half*>(p), n, pres);
++  hipMemcpyAsync(results, pres, 12, hipMemcpyDeviceToHost, hs);
++  hipStreamSynchronize(hs);
++  hipFree(pres);
++}
++
+ void broadcast_fp32(void* stream, float* dst, int dst_stride, int batches, int src_batches,
+                     float* src, int size) {
+   int x_blocks = (size+255)/256;
