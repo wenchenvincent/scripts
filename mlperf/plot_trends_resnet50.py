@@ -2,6 +2,7 @@ import sys
 import re
 import numpy as np
 import matplotlib.pyplot as plt
+import functools
 
 def get_loss_and_accuracy(lines, train=True):
     '''
@@ -18,8 +19,20 @@ def get_loss_and_accuracy(lines, train=True):
             array.append([float(match.group(1)), float(match.group(2)), float(match.group(3))])
     return np.array(array)
 
-def get_batch_from_step(step, num_of_gpus=8, batch_size_per_gpu=256, num_of_training_samples=1281167):
-    global_batch_size = num_of_gpus * batch_size_per_gpu
+def get_global_batch_size(lines):
+    found = False
+    for line in lines:
+        match = re.search(r'flags_obj\.batch_size = (\d+)', line)
+        if match:
+            global_batch_size = int(match.group(1))
+            found = True
+            break
+    if not found:
+        print("Cannot find global batch size. Please examine the log to see if there is any issue.")
+        sys.exit(1)
+    return global_batch_size
+
+def get_batch_from_step(step, global_batch_size, num_of_training_samples=1281167):
     steps_per_epoch = num_of_training_samples / global_batch_size + 1
     epoch = step / steps_per_epoch
     return epoch
@@ -61,7 +74,9 @@ if __name__ == '__main__':
         lines = fi.readlines()
         train_metrics = get_loss_and_accuracy(lines)
         test_metrics = get_loss_and_accuracy(lines,train=False)
-        train_metrics[:,0] = np.vectorize(get_batch_from_step)(train_metrics[:,0])
-        test_metrics[:,0] = np.vectorize(get_batch_from_step)(test_metrics[:,0])
+        global_batch_size = get_global_batch_size(lines)
+        get_batch_from_step_func = functools.partial(get_batch_from_step, global_batch_size=global_batch_size)
+        train_metrics[:,0] = np.vectorize(get_batch_from_step_func)(train_metrics[:,0])
+        test_metrics[:,0] = np.vectorize(get_batch_from_step_func)(test_metrics[:,0])
         plot_trends(train_metrics,test_metrics, sys.argv[2])
 
