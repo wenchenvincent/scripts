@@ -1,19 +1,15 @@
+#include <string>
+#include <stdexcept>
+#include <cuda.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 
-inline void check_cuda_(cudaError_t status) {
-    if ( status != cudaSuccess ) {
-        NVTE_ERROR("CUDA Error: " + std::string(cudaGetErrorString(status)));
-    }
-}
-
 inline void check_cublas_(cublasStatus_t status) {
     if ( status != CUBLAS_STATUS_SUCCESS ) {
-        NVTE_ERROR("CUBLAS Error: " + std::string(cublasGetStatusString(status)));
+        printf("CUBLAS Error: " + std::string(cublasGetStatusString(status)));
     }
 }
 
-#define NVTE_CHECK_CUDA(ans) { check_cuda_(ans); }
 #define NVTE_CHECK_CUBLAS(ans) { check_cublas_(ans); }
 
 int main() {
@@ -22,12 +18,14 @@ int main() {
     float zero = 0.0;
     float beta = zero;
 
+    int m = 4, n = 3, k = 2;
+
     float *A_h, *B_h, *D_h, *pre_gelu_h, *bias_grad_h;
-    malloc(&A_h, sizeof(float)*m*k);
-    malloc(&B_h, sizeof(float)*n*k);
-    malloc(&D_h, sizeof(float)*m*n);
-    malloc(&pre_gelu_h, sizeof(float)*m*n);
-    malloc(&bias_grad_h, sizeof(float)*m);
+    A_h = (float*)malloc(sizeof(float)*m*k);
+    B_h = (float*)malloc(sizeof(float)*n*k);
+    D_h = (float*)malloc(sizeof(float)*m*n);
+    pre_gelu_h = (float*)malloc(sizeof(float)*m*n);
+    bias_grad_h = (float*)malloc(sizeof(float)*m);
 
     for (int i=0;i<m*k;i++)
 	    A_h[i] = 0.1;
@@ -58,7 +56,8 @@ int main() {
     cudaMemcpy(pre_gelu, pre_gelu_h, sizeof(float)*m*n, cudaMemcpyHostToDevice);
 
     void* workspace;
-    cudaMalloc(&workspace, sizeof(float)*2*m*k*n);
+    size_t workspaceSize = sizeof(float)*2*m*k*n;
+    cudaMalloc(&workspace, workspaceSize);
 
 
     cublasLtHandle_t handle;
