@@ -1,12 +1,19 @@
+// Requires NVCC 11.4.2 to compile
 #include <string>
 #include <stdexcept>
 #include <cuda.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 
+#define NVTE_ERROR(x) \
+    do { \
+        throw std::runtime_error(std::string(__FILE__ ":") + std::to_string(__LINE__) +            \
+                                 " in function " + __func__ + ": " + x);                           \
+    } while (false)
+
 inline void check_cublas_(cublasStatus_t status) {
     if ( status != CUBLAS_STATUS_SUCCESS ) {
-        printf("CUBLAS Error: " + std::string(cublasGetStatusString(status)));
+        NVTE_ERROR("CUBLAS Error: " + std::string(cublasGetStatusString(status)));
     }
 }
 
