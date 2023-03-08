@@ -8,5 +8,13 @@ int main() {
     printf("HIP init succeeded!\n");
   else
     printf("HIP init failed!\n");
+
+  size_t free, total;
+  res = hipMemGetInfo(&free, &total);
+  if (res == hipSuccess) {
+    printf("Free memory is %ld. Total memory is %ld.\n", free, total);
+  }
+  else
+    printf("hiMemGetInfo failed.\n");
   return 0;
 }
