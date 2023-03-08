@@ -12,7 +12,7 @@ int main() {
   size_t free, total;
   res = hipMemGetInfo(&free, &total);
   if (res == hipSuccess) {
-    printf("Free memory is %ld. Total memory is %ld.\n", free, total);
+    printf("Free memory is %lu. Total memory is %lu.\n", free, total);
   }
   else
     printf("hiMemGetInfo failed.\n");
