@@ -2,7 +2,7 @@ import argparse
 import numpy as np
 
 
-def matmul(a_file, b_file, out_file, trans_a, trans_b, m, n, k, column_major=True):
+def matmul(a_file, b_file, out_file, trans_a, trans_b, m, n, k, column_major=True, use_naive=False):
     with open(a_file, "rb") as f:
         if args.datatype == 1:
             a = np.fromfile(f, np. float16)
@@ -31,12 +31,27 @@ def matmul(a_file, b_file, out_file, trans_a, trans_b, m, n, k, column_major=Tru
         B = B.T
     print(A.shape)
     print(B.shape)
-    if column_major:
-        result = np.matmul(A, B).T
+    if use_naive:
+        matmul_impl = naive_matmul
     else:
-        result = np.matmul(A, B)
+        matmul_impl = np.matmul
+    if column_major:
+        result = matmul_impl(A, B).T
+    else:
+        result = matmul_impl(A, B)
     with open(out_file, "wb") as wf:
         result.tofile(wf)
+
+def naive_matmul(A, B):
+    assert A.shape[1] == B.shape[0]
+    m, k = A.shape
+    k, n = B.shape
+    D = np.zeros((m, n), dtype=A.dtype)
+    for i in range(m):
+        for j in range(n):
+            for l in range(k):
+                D[i][j] += A[i][l] * B[l][j]
+    return D
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -50,8 +65,9 @@ if __name__ == '__main__':
     parser.add_argument('--n', action='store', default=0, type=int, help='n in GEMM') 
     parser.add_argument('--k', action='store', default=0, type=int, help='k in GEMM') 
     parser.add_argument('--column_major', action='store_true', default=False, help='bool value of column major')
+    parser.add_argument('--naive', action='store_true', default=False, help='bool value of column major')
     args = parser.parse_args()
-    matmul(args.a_file, args.b_file, args.out_file, args.trans_a, args.trans_b, args.m, args.n, args.k, args.column_major)
+    matmul(args.a_file, args.b_file, args.out_file, args.trans_a, args.trans_b, args.m, args.n, args.k, args.column_major, args.naive)
     
     
 
