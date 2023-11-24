@@ -17,12 +17,12 @@ def fwd_conv(in_data, in_filter):
 
 
 
-def fwd_conv_naive_cpu(in_data, in_filter, PadH=0, PadW=0, U=1, V=1):
+def fwd_conv_naive_cpu(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1, DilW=1):
     assert in_data.shape[3] == in_filter.shape[3], 'Input channel numbers do not match!'
     N, H, W, C = in_data.shape
     K, R, S, _ = in_filter.shape
-    P = ( H + 2 * PadH - R ) // U + 1
-    Q = ( W + 2 * PadW - S ) // V + 1
+    P = ( H + 2 * PadH - (R - 1) * DilH ) // U 
+    Q = ( W + 2 * PadW - (S - 1) * DilW ) // V 
     out = torch.zeros((N, P, Q, K), dtype=in_data.dtype)
     for n in range(N):
         for p in range(P):
@@ -36,19 +36,19 @@ def fwd_conv_naive_cpu(in_data, in_filter, PadH=0, PadW=0, U=1, V=1):
                                 #g = q * V + S - s - 1 - PadW
                                 #if f >=0 and f < H and g >=0 and g < W:
                                     #acc += in_data[n, f, g, c] * in_filter[k, R-1-r, S-1-s, c]
-                                f = p * U +  r  - PadH
-                                g = q * V +  s  - PadW
+                                f = p * U +  r * DilH - PadH
+                                g = q * V +  s * DilW - PadW
                                 if f >=0 and f < H and g >=0 and g < W:
                                     acc += in_data[n, f, g, c] * in_filter[k, r, s, c]
                     out[n, p, q, k] = acc
     return out
 
-def fwd_conv_implicit_gemm_cpu(in_data, in_filter, PadH=0, PadW=0, U=1, V=1):
+def fwd_conv_implicit_gemm_cpu(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1, DilW=1):
     assert in_data.shape[3] == in_filter.shape[3], 'Input channel numbers do not match!'
     N, H, W, C = in_data.shape
     K, R, S, _ = in_filter.shape
-    P = ( H + 2 * PadH - R ) // U + 1
-    Q = ( W + 2 * PadW - S ) // V + 1
+    P = ( H + 2 * PadH - (R - 1) * DilH ) // U 
+    Q = ( W + 2 * PadW - (S - 1) * DilW ) // V 
 
     GEMM_M = N * P * Q
     GEMM_N = K
@@ -73,11 +73,11 @@ def fwd_conv_implicit_gemm_cpu(in_data, in_filter, PadH=0, PadW=0, U=1, V=1):
                 r = crs_residual // S
                 s = crs_residual % S
 
-                f = p * U +  r  - PadH
-                g = q * V +  s  - PadW
+                f = p * U +  r * DilH - PadH
+                g = q * V +  s * DilW - PadW
                 # If it is the convolution in signal processing,
-                #f = p * U + R - r -1 - PadH
-                #g = q * V + S - s -1 - PadW
+                #f = p * U + (R - r -1) * DilH - PadH
+                #g = q * V + (S - s -1) * DilW - PadW
 
                 if f >=0 and f < H and g >=0 and g < W:
                     acc += in_data[n, f, g, c] * in_filter[k, r, s, c]
@@ -110,9 +110,9 @@ def test_correctness(N, H, W, C, K, R, S):
     weight = torch.randn(K, R, S, C)
     in_data_torch = in_data.permute(0, 3, 1, 2).to(device='cuda')
     weight_torch = weight.permute(0, 3, 1, 2).to(device='cuda')
-    torch_output = torch.nn.functional.conv2d(in_data_torch, weight_torch, padding=1, stride=(2,1)).permute(0, 2, 3, 1)
-    #cpu_output = fwd_conv_naive_cpu(in_data, weight, PadH=1, PadW=1, U=2, V=1)
-    cpu_output = fwd_conv_implicit_gemm_cpu(in_data, weight, PadH=1, PadW=1, U=2, V=1)
+    torch_output = torch.nn.functional.conv2d(in_data_torch, weight_torch, padding=1, dilation=2, stride=(2,1)).permute(0, 2, 3, 1)
+    #cpu_output = fwd_conv_naive_cpu(in_data, weight, PadH=1, PadW=1, U=2, V=1, DilH=2, DilW=2)
+    cpu_output = fwd_conv_implicit_gemm_cpu(in_data, weight, PadH=1, PadW=1, U=2, V=1, DilH=2, DilW=2)
     print(f'torch_output.shape={torch_output.shape}')
     print(f'cpu_output.shape={cpu_output.shape}')
     print(f'torch_output={torch_output}')
