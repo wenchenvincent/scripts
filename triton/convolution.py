@@ -185,22 +185,37 @@ def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1,
     print(f'N={N},H={H},W={W},C={C},K={K},R={R},S={S},P={P},Q={Q}')
     print(f'GEMM_M={GEMM_M},GEMM_N={GEMM_N},GEMM_K={GEMM_K}')
 
-    out = torch.empty((GEMM_M, GEMM_N), dtype=in_data.dtype)
+    out = torch.empty((GEMM_M, GEMM_N), dtype=in_data.dtype, device='cuda')
 
     grid = lambda META: (
-        triton.cdiv(GEMM_M, META['BLOCK_SIZE_GEMM_M']) * triton.cdiv(GEMM_N, META['BLOCK_SIZE_GEMM_N'])
+        triton.cdiv(GEMM_M, META['BLOCK_SIZE_GEMM_M']) * triton.cdiv(GEMM_N, META['BLOCK_SIZE_GEMM_N']),
     )
+    fwd_conv_implicit_gemm_kernel[grid](
+        in_data, in_filter, out,
+        N, H, W, C, K, R, S, P, Q,
+        GEMM_M, GEMM_N, GEMM_K,
+        in_data.stride(0), in_data.stride(1), in_data.stride(2), in_data.stride(3),
+        in_filter.stride(0), in_filter.stride(1), in_filter.stride(2),
+        U, V, PadH, PadW, DilH, DilW
+    )
+    return out.reshape((N,P,Q,K))
 
+@triton.autotune(
+    configs = [
+        triton.Config({'BLOCK_SIZE_GEMM_M': 16, 'BLOCK_SIZE_GEMM_N': 16, 'BLOCK_SIZE_GEMM_K': 16})
+    ],
+    key = ['GEMM_M', 'GEMM_N', 'GEMM_K']
+)
 @triton.jit
-def fwd_conv_implicit_gemm(
+def fwd_conv_implicit_gemm_kernel(
     # Pointers
     data_ptr, filter_ptr, out_ptr,
-    N, H, W, C, K, R, S,
+    N, H, W, C, K, R, S, P, Q,
     GEMM_M, GEMM_N, GEMM_K,
     stride_n, stride_h, stride_w, stride_c,
     stride_k, stride_r, stride_s,
+    U, V, PadH, PadW, DilH, DilW,
     BLOCK_SIZE_GEMM_M: tl.constexpr, BLOCK_SIZE_GEMM_N: tl.constexpr, BLOCK_SIZE_GEMM_K: tl.constexpr, 
-    GROUP_SIZE_M: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_gemm_m = tl.cdiv(GEMM_M, BLOCK_SIZE_GEMM_M)
@@ -219,7 +234,7 @@ def fwd_conv_implicit_gemm(
 
     offs_k = offs_gemm_n
 
-    accumulator = tf.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_GEMM_M, BLOCK_SIZE_GEMM_N), dtype=tl.float32)
     for gemm_k in range(0, tl.cdiv(GEMM_K, BLOCK_SIZE_GEMM_K)):
         offs_gemm_k = gemm_k * BLOCK_SIZE_GEMM_K + tl.arange(0, BLOCK_SIZE_GEMM_K)
         offs_c = offs_gemm_k // (R*S)
@@ -228,21 +243,29 @@ def fwd_conv_implicit_gemm(
         offs_r = offs_crs_residual // S
         offs_s = offs_crs_residual % S
 
-        offs_h = p[:,None] * U + r[None,:] * DilH - PadH
-        offs_w = q[:,None] * U + s[None,:] * DilW - PadW
+        offs_h = offs_p[:,None] * U + offs_r[None,:] * DilH - PadH
+        offs_w = offs_q[:,None] * U + offs_s[None,:] * DilW - PadW
 
-        a_ptrs = data_ptr + offs_n[:, None, None, None] * stride_n + offs_h[None, :, :, None] * stride_h \
-                             + offs_w[None, :, :, None] * stride_w + offs_k[None, None, None, :] * stride_k 
+        #Triton can only handle two dimensional pointer arithemtics
+        #a_ptrs = data_ptr + offs_n[:, None, None, None] * stride_n + offs_h[None, :, :, None] * stride_h \
+                             #+ offs_w[None, :, :, None] * stride_w + offs_k[None, None, None, :] * stride_k 
         # filter is [K, R, S, C], filter.transpose is [C, R, S, K]
-        b_ptrs = filter_ptr + offs_c[:, None, None, None] * stride_c + offs_r[None, :, None, None] * stride_r \
-                                       + offs_s[None, None, :, None] * stride_s + offs_k[None, None, None, :] * stride_k
-        mask_a = (offs_n[:, None, None, None] < N) & (offs_h[None, :, :, None] >= 0) & (offs_h[None, :, :, None] < H) \
-                & (offs_w[None, :, :, None] >=0) & (offs_w[None, :, :, None] < W) & (offs_c[None, None, None, :] <C)
-        mask_b = (offs_c[:, None, None, None] < C) & (offs_r[None, :, None, None] < R) & offs_s[None, None, :, None] < S) & (offs_k[None, None, None, :] < K)
-        a = tl.load(a_ptrs, mask_a, ohter=0.0)
-        b = tl.load(b_ptrs, mask_b, ohter=0.0)
+        #b_ptrs = filter_ptr + offs_c[:, None, None, None] * stride_c + offs_r[None, :, None, None] * stride_r \
+                                       #+ offs_s[None, None, :, None] * stride_s + offs_k[None, None, None, :] * stride_k
+        #mask_a = (offs_n[:, None, None, None] < N) & (offs_h[None, :, :, None] >= 0) & (offs_h[None, :, :, None] < H) \
+        #        & (offs_w[None, :, :, None] >=0) & (offs_w[None, :, :, None] < W) & (offs_c[None, None, None, :] <C)
+        #mask_b = (offs_c[:, None, None, None] < C) & (offs_r[None, :, None, None] < R) & (offs_s[None, None, :, None] < S) & (offs_k[None, None, None, :] < K)
+        a_ptrs = data_ptr + offs_n[:, None] * stride_n + offs_h * stride_h \
+                          + offs_w * stride_w + offs_c[None, :] * stride_c 
+        b_ptrs = filter_ptr + offs_c[:, None] * stride_c + offs_r[:, None] * stride_r \
+                            + offs_s[:, None] * stride_s + offs_k[None, :] * stride_k
+        mask_a = (offs_n[:, None] < N) & (offs_h >= 0) & (offs_h < H) \
+                & (offs_w >=0) & (offs_w < W) & (offs_c[None, :] <C)
+        mask_b = (offs_c[:, None] < C) & (offs_r[:, None] < R) & (offs_s[:, None] < S) & (offs_k[None, :] < K)
+        a = tl.load(a_ptrs, mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask_b, other=0.0)
         accumulator += tl.dot(a, b)
-    c = accumulator.to(data_ptr.dtype)
+    c = accumulator
 
     out_ptrs = out_ptr + offs_gemm_m[:, None] * GEMM_N + offs_gemm_n[None, :]
     mask_out = (offs_gemm_m[:, None] < GEMM_M) & (offs_gemm_n[None, :] < GEMM_N)
@@ -267,19 +290,20 @@ def test_correctness(N, H, W, C, K, R, S):
     V: horizontal stride
     '''
     torch.manual_seed(0)
-    in_data = torch.randn(N, H, W, C)
-    weight = torch.randn(K, R, S, C)
-    in_data_torch = in_data.permute(0, 3, 1, 2).to(device='cuda')
-    weight_torch = weight.permute(0, 3, 1, 2).to(device='cuda')
+    in_data = torch.randn(N, H, W, C, device='cuda')
+    weight = torch.randn(K, R, S, C, device='cuda')
+    in_data_torch = in_data.permute(0, 3, 1, 2)
+    weight_torch = weight.permute(0, 3, 1, 2)
     torch_output = torch.nn.functional.conv2d(in_data_torch, weight_torch, padding=1, dilation=1, stride=(1,1)).permute(0, 2, 3, 1)
+    triton_output = fwd_conv_implicit_gemm(in_data, weight, PadH=1, PadW=1, U=1, V=1, DilH=1, DilW=1)
     #cpu_output = fwd_conv_naive_cpu(in_data, weight, PadH=1, PadW=1, U=2, V=1, DilH=2, DilW=2)
     #cpu_output0 = fwd_conv_implicit_gemm_cpu(in_data.numpy(), weight.numpy(), PadH=1, PadW=1, U=1, V=1, DilH=1, DilW=1)
-    cpu_output = fwd_conv_implicit_gemm_cpu_blocked(in_data.numpy(), weight.numpy(), PadH=1, PadW=1, U=1, V=1, DilH=1, DilW=1)
+    #cpu_output = fwd_conv_implicit_gemm_cpu_blocked(in_data.numpy(), weight.numpy(), PadH=1, PadW=1, U=1, V=1, DilH=1, DilW=1)
     print(f'torch_output.shape={torch_output.shape}')
-    print(f'cpu_output.shape={cpu_output.shape}')
+    print(f'triton_output.shape={triton_output.shape}')
     print(f'torch_output={torch_output}')
-    print(f'cpu_output={cpu_output}')
-    if np.allclose(cpu_output, torch_output.cpu().numpy(), atol=1e-2, rtol=1e-2):
+    print(f'triton_output={triton_output}')
+    if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=1e-2):
         print("✅ CPU and Torch match")
     else:
         print("❌ CPU and Torch differ")
