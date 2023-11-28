@@ -171,6 +171,85 @@ def fwd_conv_implicit_gemm_cpu_blocked(in_data, in_filter, PadH=0, PadW=0, U=1, 
     out = out.reshape((N, P, Q, K))
     return out
 
+
+def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1, DilW=1):
+    assert in_data.shape[3] == in_filter.shape[3], 'Input channel numbers do not match!'
+    N, H, W, C = in_data.shape
+    K, R, S, _ = in_filter.shape
+    P = ( H + 2 * PadH - (R - 1) * DilH ) // U 
+    Q = ( W + 2 * PadW - (S - 1) * DilW ) // V 
+
+    GEMM_M = N * P * Q
+    GEMM_N = K
+    GEMM_K = C * R * S
+    print(f'N={N},H={H},W={W},C={C},K={K},R={R},S={S},P={P},Q={Q}')
+    print(f'GEMM_M={GEMM_M},GEMM_N={GEMM_N},GEMM_K={GEMM_K}')
+
+    out = torch.empty((GEMM_M, GEMM_N), dtype=in_data.dtype)
+
+    grid = lambda META: (
+        triton.cdiv(GEMM_M, META['BLOCK_SIZE_GEMM_M']) * triton.cdiv(GEMM_N, META['BLOCK_SIZE_GEMM_N'])
+    )
+
+@triton.jit
+def fwd_conv_implicit_gemm(
+    # Pointers
+    data_ptr, filter_ptr, out_ptr,
+    N, H, W, C, K, R, S,
+    GEMM_M, GEMM_N, GEMM_K,
+    stride_n, stride_h, stride_w, stride_c,
+    stride_k, stride_r, stride_s,
+    BLOCK_SIZE_GEMM_M: tl.constexpr, BLOCK_SIZE_GEMM_N: tl.constexpr, BLOCK_SIZE_GEMM_K: tl.constexpr, 
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_gemm_m = tl.cdiv(GEMM_M, BLOCK_SIZE_GEMM_M)
+    num_pid_gemm_n = tl.cdiv(GEMM_N, BLOCK_SIZE_GEMM_N)
+    pid_gemm_m = pid // num_pid_gemm_n
+    pid_gemm_n = pid % num_pid_gemm_n
+
+    offs_gemm_m = pid_gemm_m * BLOCK_SIZE_GEMM_M + tl.arange(0, BLOCK_SIZE_GEMM_M)
+    offs_gemm_n = pid_gemm_n * BLOCK_SIZE_GEMM_N + tl.arange(0, BLOCK_SIZE_GEMM_N) #Need %?
+
+    offs_n =  offs_gemm_m // (P*Q)
+    offs_npq_residual = offs_gemm_m % (P*Q)
+
+    offs_p = offs_npq_residual // Q
+    offs_q = offs_npq_residual % Q
+
+    offs_k = offs_gemm_n
+
+    accumulator = tf.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for gemm_k in range(0, tl.cdiv(GEMM_K, BLOCK_SIZE_GEMM_K)):
+        offs_gemm_k = gemm_k * BLOCK_SIZE_GEMM_K + tl.arange(0, BLOCK_SIZE_GEMM_K)
+        offs_c = offs_gemm_k // (R*S)
+        offs_crs_residual = offs_gemm_k % (R*S)
+
+        offs_r = offs_crs_residual // S
+        offs_s = offs_crs_residual % S
+
+        offs_h = p[:,None] * U + r[None,:] * DilH - PadH
+        offs_w = q[:,None] * U + s[None,:] * DilW - PadW
+
+        a_ptrs = data_ptr + offs_n[:, None, None, None] * stride_n + offs_h[None, :, :, None] * stride_h \
+                             + offs_w[None, :, :, None] * stride_w + offs_k[None, None, None, :] * stride_k 
+        # filter is [K, R, S, C], filter.transpose is [C, R, S, K]
+        b_ptrs = filter_ptr + offs_c[:, None, None, None] * stride_c + offs_r[None, :, None, None] * stride_r \
+                                       + offs_s[None, None, :, None] * stride_s + offs_k[None, None, None, :] * stride_k
+        mask_a = (offs_n[:, None, None, None] < N) & (offs_h[None, :, :, None] >= 0) & (offs_h[None, :, :, None] < H) \
+                & (offs_w[None, :, :, None] >=0) & (offs_w[None, :, :, None] < W) & (offs_c[None, None, None, :] <C)
+        mask_b = (offs_c[:, None, None, None] < C) & (offs_r[None, :, None, None] < R) & offs_s[None, None, :, None] < S) & (offs_k[None, None, None, :] < K)
+        a = tl.load(a_ptrs, mask_a, ohter=0.0)
+        b = tl.load(b_ptrs, mask_b, ohter=0.0)
+        accumulator += tl.dot(a, b)
+    c = accumulator.to(data_ptr.dtype)
+
+    out_ptrs = out_ptr + offs_gemm_m[:, None] * GEMM_N + offs_gemm_n[None, :]
+    mask_out = (offs_gemm_m[:, None] < GEMM_M) & (offs_gemm_n[None, :] < GEMM_N)
+    tl.store(out_ptrs, c, mask_out)
+         
+
+
 @pytest.mark.parametrize("N, H, W, C, K, R, S",
 [ (4, 16, 16, 4, 8, 3, 3) 
 ]
