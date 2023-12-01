@@ -182,10 +182,18 @@ def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1,
     GEMM_M = N * P * Q
     GEMM_N = K
     GEMM_K = C * R * S
+    '''
     print(f'N={N},H={H},W={W},C={C},K={K},R={R},S={S},P={P},Q={Q}')
     print(f'GEMM_M={GEMM_M},GEMM_N={GEMM_N},GEMM_K={GEMM_K}')
+    '''
 
     out = torch.empty((GEMM_M, GEMM_N), dtype=in_data.dtype, device='cuda')
+    '''
+    if out.dtype == torch.float16:
+        out_dtype = tl.float16
+    elif out.dtype == torch.float32:
+        out_dtype = tl.float32
+    '''
 
     grid = lambda META: (
         triton.cdiv(GEMM_M, META['BLOCK_SIZE_GEMM_M']) * triton.cdiv(GEMM_N, META['BLOCK_SIZE_GEMM_N']),
@@ -196,13 +204,15 @@ def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1,
         GEMM_M, GEMM_N, GEMM_K,
         in_data.stride(0), in_data.stride(1), in_data.stride(2), in_data.stride(3),
         in_filter.stride(0), in_filter.stride(1), in_filter.stride(2),
-        U, V, PadH, PadW, DilH, DilW
+        U, V, PadH, PadW, DilH, DilW,
     )
     return out.reshape((N,P,Q,K))
 
 @triton.autotune(
     configs = [
-        triton.Config({'BLOCK_SIZE_GEMM_M': 16, 'BLOCK_SIZE_GEMM_N': 16, 'BLOCK_SIZE_GEMM_K': 16})
+        triton.Config({'BLOCK_SIZE_GEMM_M': 32, 'BLOCK_SIZE_GEMM_N': 16, 'BLOCK_SIZE_GEMM_K': 16}, num_stages=0),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 32, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32}, num_stages=0),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32}, num_stages=0),
     ],
     key = ['GEMM_M', 'GEMM_N', 'GEMM_K']
 )
@@ -265,7 +275,7 @@ def fwd_conv_implicit_gemm_kernel(
         a = tl.load(a_ptrs, mask_a, other=0.0)
         b = tl.load(b_ptrs, mask_b, other=0.0)
         accumulator += tl.dot(a, b)
-    c = accumulator
+    c = accumulator.to(tl.float16)
 
     out_ptrs = out_ptr + offs_gemm_m[:, None] * GEMM_N + offs_gemm_n[None, :]
     mask_out = (offs_gemm_m[:, None] < GEMM_M) & (offs_gemm_n[None, :] < GEMM_N)
@@ -309,4 +319,85 @@ def test_correctness(N, H, W, C, K, R, S):
         print("❌ CPU and Torch differ")
     
     
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N', 'H', 'W', 'C', 'K', 'R', 'S', 'U', 'V', 'PadH', 'PadW', 'DilH', 'DilW'],  # Argument names to use as an x-axis for the plot
+        x_vals=[ batch_size + act_filt_size + misc
+            for batch_size in [(1,), (32,), (64,), (128,), (256,), (512,)]
+            for act_filt_size in
+            [ 
+              (56,  56,   64,   256, 1, 1),
+              (56,  56,   64,    64, 1, 1),
+              (56,  56,   64,    64, 3, 3),
+              (56,  56,  256,    64, 1, 1),
+              (56,  56,  256,   512, 1, 1),
+              (56,  56,  256,   128, 1, 1),
+              (28,  28,  128,   128, 3, 3),
+              (28,  28,  128,   512, 1, 1),
+              (28,  28,  512,   128, 1, 1),
+              (28,  28,  512,  1024, 1, 1),
+              (28,  28,  512,   256, 1, 1),
+              (14,  14,  256,   256, 3, 3),
+              (14,  14,  256,  1024, 1, 1),
+              (14,  14,  1024,  256, 1, 1),
+              (14,  14,  1024, 2048, 1, 1),
+              (14,  14,  1024,  512, 1, 1),
+              (7,    7,   512,  512, 3, 3),
+            ]
+            for misc in [(1, 1, 0, 0, 1, 1)]
+        ],  # Different possible values for `x_name`
+        line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
+        # Possible values for `line_arg`
+        line_vals=['miopen', 'triton'],
+        # Label name for the lines
+        line_names=["Miopen", "Triton"],
+        # Line styles
+        styles=[('green', '-'), ('blue', '-')],
+        ylabel="TFLOPS",  # Label name for the y-axis
+        plot_name="conv-performance",  # Name for the plot, used also as a file name for saving the plot.
+        args={},
+    )
+)
+def benchmark(N, H, W, C, K, R, S, U, V, PadH, PadW, DilH, DilW, provider):
+    in_data = torch.randn(N, H, W, C, device='cuda', dtype=torch.float16)
+    weight = torch.randn(K, R, S, C, device='cuda', dtype=torch.float16)
+    in_data_torch = in_data.permute(0, 3, 1, 2)
+    weight_torch = weight.permute(0, 3, 1, 2)
+    
+    P = ( H + 2 * PadH - (R - 1) * DilH ) // U 
+    Q = ( W + 2 * PadW - (S - 1) * DilW ) // V 
 
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == 'miopen':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.nn.functional.conv2d(in_data_torch, weight_torch), quantiles=quantiles)
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: fwd_conv_implicit_gemm(in_data, weight), quantiles=quantiles)
+        global verbose
+        if verbose:
+            print(f'SIZE: {N},{H},{W},{C}, {K},{R},{S}   Best tuning config: ({fwd_conv_implicit_gemm_kernel.get_best_config()})')
+    perf = lambda ms: 2 * (N*P*Q) * K * (C*R*S) * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="Conv tutorial example",
+        allow_abbrev=False,
+    )
+
+    parser.add_argument("-v", action='store_true', default=False, help="Print out the best tuning config")
+    args = parser.parse_args()
+
+    return args
+
+
+def main():
+    # assign to a global verbose var to indicate whether print
+    # best tuning config
+    global verbose
+    args = parse_args()
+    verbose=args.v
+    benchmark.run(show_plots=True, print_data=True)
+
+if __name__ == '__main__':
+    sys.exit(main())
