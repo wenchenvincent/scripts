@@ -7,9 +7,6 @@ import sys
 import argparse
 import pytest
 
-@triton.jit
-def fwd_conv_kernel():
-    pass
 
 def fwd_conv(in_data, in_filter):
     assert in_data.is_contiguous(), "Input Data must but contiguous"
@@ -208,6 +205,7 @@ def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1,
     )
     return out.reshape((N,P,Q,K))
 
+'''
 @triton.autotune(
     configs = [
         triton.Config({'BLOCK_SIZE_GEMM_M': 32, 'BLOCK_SIZE_GEMM_N': 16, 'BLOCK_SIZE_GEMM_K': 16}, num_stages=0),
@@ -215,6 +213,28 @@ def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1,
         triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32}, num_stages=0),
     ],
     key = ['GEMM_M', 'GEMM_N', 'GEMM_K']
+)
+'''
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 256, 'BLOCK_SIZE_GEMM_K': 64, 'GROUP_SIZE_GEMM_M': 8}, num_stages=3,
+                      num_warps=8),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 256, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 128, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 64, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 128, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=5,
+                      num_warps=2),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 32, 'BLOCK_SIZE_GEMM_N': 64, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=5,
+                      num_warps=2),
+    ],
+    key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
 )
 @triton.jit
 def fwd_conv_implicit_gemm_kernel(
@@ -226,12 +246,17 @@ def fwd_conv_implicit_gemm_kernel(
     stride_k, stride_r, stride_s,
     U, V, PadH, PadW, DilH, DilW,
     BLOCK_SIZE_GEMM_M: tl.constexpr, BLOCK_SIZE_GEMM_N: tl.constexpr, BLOCK_SIZE_GEMM_K: tl.constexpr, 
+    GROUP_SIZE_GEMM_M: tl.constexpr,  
 ):
     pid = tl.program_id(axis=0)
     num_pid_gemm_m = tl.cdiv(GEMM_M, BLOCK_SIZE_GEMM_M)
     num_pid_gemm_n = tl.cdiv(GEMM_N, BLOCK_SIZE_GEMM_N)
-    pid_gemm_m = pid // num_pid_gemm_n
-    pid_gemm_n = pid % num_pid_gemm_n
+    num_pid_in_group = GROUP_SIZE_GEMM_M * num_pid_gemm_n
+    group_id = pid // num_pid_in_group
+    first_pid_gemm_m = group_id * GROUP_SIZE_GEMM_M
+    group_size_gemm_m = min(num_pid_gemm_m - first_pid_gemm_m, GROUP_SIZE_GEMM_M)
+    pid_gemm_m = first_pid_gemm_m + (pid % group_size_gemm_m)
+    pid_gemm_n = (pid % num_pid_in_group) // group_size_gemm_m
 
     offs_gemm_m = pid_gemm_m * BLOCK_SIZE_GEMM_M + tl.arange(0, BLOCK_SIZE_GEMM_M)
     offs_gemm_n = pid_gemm_n * BLOCK_SIZE_GEMM_N + tl.arange(0, BLOCK_SIZE_GEMM_N) #Need %?
@@ -300,8 +325,8 @@ def test_correctness(N, H, W, C, K, R, S):
     V: horizontal stride
     '''
     torch.manual_seed(0)
-    in_data = torch.randn(N, H, W, C, device='cuda')
-    weight = torch.randn(K, R, S, C, device='cuda')
+    in_data = torch.randn((N, H, W, C), device='cuda')
+    weight = torch.randn((K, R, S, C), device='cuda')
     in_data_torch = in_data.permute(0, 3, 1, 2)
     weight_torch = weight.permute(0, 3, 1, 2)
     torch_output = torch.nn.functional.conv2d(in_data_torch, weight_torch, padding=1, dilation=1, stride=(1,1)).permute(0, 2, 3, 1)
@@ -359,8 +384,8 @@ def test_correctness(N, H, W, C, K, R, S):
     )
 )
 def benchmark(N, H, W, C, K, R, S, U, V, PadH, PadW, DilH, DilW, provider):
-    in_data = torch.randn(N, H, W, C, device='cuda', dtype=torch.float16)
-    weight = torch.randn(K, R, S, C, device='cuda', dtype=torch.float16)
+    in_data = torch.randn((N, H, W, C), device='cuda', dtype=torch.float16)
+    weight = torch.randn((K, R, S, C), device='cuda', dtype=torch.float16)
     in_data_torch = in_data.permute(0, 3, 1, 2)
     weight_torch = weight.permute(0, 3, 1, 2)
     
