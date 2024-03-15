@@ -23,7 +23,7 @@ def fwd_conv_implicit_gemm(in_data, in_filter, PadH=0, PadW=0, U=1, V=1, DilH=1,
     grid = lambda META: (
         triton.cdiv(GEMM_M, META['BLOCK_SIZE_GEMM_M']) * triton.cdiv(GEMM_N, META['BLOCK_SIZE_GEMM_N']),
     )
-    fwd_conv_implicit_gemm_kernel[grid](
+    fwd_conv_implicit_gemm_kernel_rewrite[grid](
         in_data, in_filter, out,
         N, H, W, C, K, R, S, P, Q,
         GEMM_M, GEMM_N, GEMM_K,
@@ -118,7 +118,7 @@ def fwd_conv_implicit_gemm_kernel(
         offs_s = offs_crs_residual % S
 
         offs_h = offs_p[:,None] * U + offs_r[None,:] * DilH - PadH
-        offs_w = offs_q[:,None] * U + offs_s[None,:] * DilW - PadW
+        offs_w = offs_q[:,None] * V + offs_s[None,:] * DilW - PadW
 
         #Triton can only handle two dimensional pointer arithemtics
         # filter is [K, R, S, C], filter.transpose is [C, R, S, K]
@@ -139,6 +139,111 @@ def fwd_conv_implicit_gemm_kernel(
     tl.store(out_ptrs, c, mask_out)
          
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 256, 'BLOCK_SIZE_GEMM_K': 64, 'GROUP_SIZE_GEMM_M': 8}, num_stages=3,
+                      num_warps=8),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 256, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 128, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 64, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 128, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=4,
+                      num_warps=4),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 32, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=5,
+                      num_warps=2),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 32, 'BLOCK_SIZE_GEMM_N': 64, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8}, num_stages=5,
+                      num_warps=2),
+    ] if torch.version.hip is None else [
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 256, 'BLOCK_SIZE_GEMM_K': 16, 'GROUP_SIZE_GEMM_M': 1, 'waves_per_eu': 2},
+                      num_warps=4, num_stages=0),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 256, 'BLOCK_SIZE_GEMM_N': 256, 'BLOCK_SIZE_GEMM_K': 16, 'GROUP_SIZE_GEMM_M': 4, 'waves_per_eu': 2},
+                      num_warps=8, num_stages=0),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 128, 'BLOCK_SIZE_GEMM_N': 128, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 1, 'waves_per_eu': 2},
+                      num_warps=8, num_stages=0),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 128, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 8, 'waves_per_eu': 3},
+                      num_warps=4, num_stages=0),
+        triton.Config({'BLOCK_SIZE_GEMM_M': 64, 'BLOCK_SIZE_GEMM_N': 64, 'BLOCK_SIZE_GEMM_K': 32, 'GROUP_SIZE_GEMM_M': 1, 'waves_per_eu': 8},
+                      num_warps=4, num_stages=0),
+    ],
+    key=['GEMM_M', 'GEMM_N', 'GEMM_K'],
+)
+@triton.jit
+def fwd_conv_implicit_gemm_kernel_rewrite(
+    # Pointers
+    data_ptr, filter_ptr, out_ptr,
+    N, H, W, C, K, R, S, P, Q,
+    GEMM_M, GEMM_N, GEMM_K,
+    stride_n, stride_h, stride_w, stride_c,
+    stride_k, stride_r, stride_s,
+    U, V, PadH, PadW, DilH, DilW,
+    BLOCK_SIZE_GEMM_M: tl.constexpr, BLOCK_SIZE_GEMM_N: tl.constexpr, BLOCK_SIZE_GEMM_K: tl.constexpr, 
+    GROUP_SIZE_GEMM_M: tl.constexpr,  
+):
+    pid = tl.program_id(axis=0)
+    num_pid_gemm_m = tl.cdiv(GEMM_M, BLOCK_SIZE_GEMM_M)
+    num_pid_gemm_n = tl.cdiv(GEMM_N, BLOCK_SIZE_GEMM_N)
+    num_pid_in_group = GROUP_SIZE_GEMM_M * num_pid_gemm_n
+    group_id = pid // num_pid_in_group
+    first_pid_gemm_m = group_id * GROUP_SIZE_GEMM_M
+    group_size_gemm_m = min(num_pid_gemm_m - first_pid_gemm_m, GROUP_SIZE_GEMM_M)
+    pid_gemm_m = first_pid_gemm_m + (pid % group_size_gemm_m)
+    pid_gemm_n = (pid % num_pid_in_group) // group_size_gemm_m
+
+    offs_gemm_m = pid_gemm_m * BLOCK_SIZE_GEMM_M + tl.arange(0, BLOCK_SIZE_GEMM_M)
+    offs_gemm_n = pid_gemm_n * BLOCK_SIZE_GEMM_N + tl.arange(0, BLOCK_SIZE_GEMM_N) #Need %?
+
+    offs_n =  offs_gemm_m // (P*Q)
+    offs_npq_residual = offs_gemm_m % (P*Q)
+
+    offs_p = offs_npq_residual // Q
+    offs_q = offs_npq_residual % Q
+
+    offs_k = offs_gemm_n
+
+    x_base = data_ptr + offs_n[:, None] * stride_n
+    w_base = filter_ptr + offs_k[None, :] * stride_k
+    accumulator = tl.zeros((BLOCK_SIZE_GEMM_M, BLOCK_SIZE_GEMM_N), dtype=tl.float32)
+    block_k_count = tl.cdiv(C, BLOCK_SIZE_GEMM_K)
+    for ijk in range(R*S*block_k_count):
+        k = (ijk%block_k_count)*BLOCK_SIZE_GEMM_K
+        ij = ijk // block_k_count
+        i = ij // S
+        j = ij % S
+
+        idx_x_h = i * DilH - PadH + offs_p * U
+        idx_x_w = j * DilW - PadW + offs_q * V
+        idx_x_c = tl.arange(0, BLOCK_SIZE_GEMM_K) + k
+
+        x_ptrs = x_base + (
+            (idx_x_h * stride_h)[:, None]
+            + (idx_x_w * stride_w)[:, None]
+            + (idx_x_c * stride_c)[None, :]
+        )
+        mask_x = (
+            (offs_n < N)[:, None]
+            & (idx_x_h >= 0)[:, None]
+            & (idx_x_h < H)[:, None]
+            & (idx_x_w >= 0)[:, None]
+            & (idx_x_w < W)[:, None]
+            & (idx_x_c < C)[None, :]
+        )
+        matrix_x = tl.load(x_ptrs, mask=mask_x, other=0.0)
+
+        w_ptrs = w_base + (
+            (idx_x_c * stride_c)[:, None] + (i * stride_r) + (j * stride_s)
+        )
+        mask_w = (idx_x_c[:, None] < C) & (offs_k[None, :] < K)
+        matrix_w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+        accumulator += tl.dot(matrix_x, matrix_w)
+    c = accumulator.to(tl.float16)
+
+    out_ptrs = out_ptr + offs_gemm_m[:, None] * GEMM_N + offs_gemm_n[None, :]
+    mask_out = (offs_gemm_m[:, None] < GEMM_M) & (offs_gemm_n[None, :] < GEMM_N)
+    tl.store(out_ptrs, c, mask_out)
 
 @pytest.mark.parametrize("N, H, W, C, K, R, S",
 [ (4, 16, 16, 4, 8, 3, 3) 
@@ -208,6 +313,7 @@ def benchmark(N, H, W, C, K, R, S, U, V, PadH, PadW, DilH, DilW, provider):
     weight = torch.randn((K, R, S, C), device='cuda', dtype=torch.float16)
     in_data_torch = in_data.permute(0, 3, 1, 2)
     weight_torch = weight.permute(0, 3, 1, 2)
+    print(f'stride_k={weight.stride(0)}, stride_r={weight.stride(1)}, stride_s={weight.stride(2)}, stride_c={weight.stride(3)}')
     
     P = ( H + 2 * PadH - (R - 1) * DilH ) // U 
     Q = ( W + 2 * PadW - (S - 1) * DilW ) // V 
