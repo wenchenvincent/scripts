@@ -57,8 +57,12 @@ void simpleGemm(hipblasLtHandle_t  handle,
                 hipStream_t        stream)
 {
     hipblasLtMatrixLayout_t matA, matB, matC, matD;
-    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matA, HIP_R_8F_E4M3_FNUZ, m, k, m));
-    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matB, HIP_R_8F_E4M3_FNUZ, k, n, k));
+		int64_t lda = trans_a == HIPBLAS_OP_N ? m : k;
+		int64_t ldb = trans_b == HIPBLAS_OP_N ? k : n;
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matA, HIP_R_8F_E4M3_FNUZ, trans_a == HIPBLAS_OP_N ? m : k, trans_a == HIPBLAS_OP_N ? k : m, lda));
+    CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matB, HIP_R_8F_E4M3_FNUZ, trans_b == HIPBLAS_OP_N ? k : n, trans_b == HIPBLAS_OP_N ? n : k, ldb));
+    //CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matA, HIP_R_8F_E4M3_FNUZ, m, k, m));
+    //CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matB, HIP_R_8F_E4M3_FNUZ, k, n, k));
     CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matC, HIP_R_8F_E4M3_FNUZ, m, n, m));
     CHECK_HIPBLASLT_ERROR(hipblasLtMatrixLayoutCreate(&matD, HIP_R_8F_E4M3_FNUZ, m, n, m));
 
@@ -74,6 +78,7 @@ void simpleGemm(hipblasLtHandle_t  handle,
 
     CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+
 
 
     // Set User Preference attributes
@@ -132,6 +137,7 @@ void simpleGemm(hipblasLtHandle_t  handle,
 		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
 												  HIPBLASLT_MATMUL_DESC_AMAX_D_POINTER,
 													&d_damax, sizeof(d_damax)));
+
 
     CHECK_HIPBLASLT_ERROR(hipblasLtMatmul(handle,
                                           matmul,
@@ -225,7 +231,7 @@ int main()
 		CHECK_HIP_ERROR(hipHostMalloc(&a, m * k * sizeof(char)));
 		CHECK_HIP_ERROR(hipHostMalloc(&b, n * k * sizeof(char)));
 		CHECK_HIP_ERROR(hipHostMalloc(&d, m * n * sizeof(char)));
-		CHECK_HIP_ERROR(hipHostMalloc(&workspace, workspaceSize));
+		CHECK_HIP_ERROR(hipMalloc(&workspace, workspaceSize));
 		
 	}
 
