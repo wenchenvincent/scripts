@@ -80,6 +80,23 @@ void simpleGemm(hipblasLtHandle_t  handle,
         matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
 
 
+		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
+												  HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+													&d_scale_a, sizeof(d_scale_a)));
+		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
+												  HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+													&d_scale_b, sizeof(d_scale_b)));
+		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
+												  HIPBLASLT_MATMUL_DESC_C_SCALE_POINTER,
+													&d_scale_c, sizeof(d_scale_c)));
+		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
+												  HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER,
+													&d_scale_d, sizeof(d_scale_d)));
+
+		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
+												  HIPBLASLT_MATMUL_DESC_AMAX_D_POINTER,
+													&d_damax, sizeof(d_damax)));
+
 
     // Set User Preference attributes
     hipblasLtMatmulPreference_t pref;
@@ -120,23 +137,6 @@ void simpleGemm(hipblasLtHandle_t  handle,
     // If not, allocate d_workspace here
     // CHECK_HIP_ERRORhipMalloc(&d_workspace, workspace_size));
 		std::cout << "workspace_size=" << workspace_size << std::endl;
-
-		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
-												  HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-													&d_scale_a, sizeof(d_scale_a)));
-		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
-												  HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-													&d_scale_b, sizeof(d_scale_b)));
-		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
-												  HIPBLASLT_MATMUL_DESC_C_SCALE_POINTER,
-													&d_scale_c, sizeof(d_scale_c)));
-		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
-												  HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER,
-													&d_scale_d, sizeof(d_scale_d)));
-
-		CHECK_HIPBLASLT_ERROR(hipblasLtMatmulDescSetAttribute(matmul,
-												  HIPBLASLT_MATMUL_DESC_AMAX_D_POINTER,
-													&d_damax, sizeof(d_damax)));
 
 
     CHECK_HIPBLASLT_ERROR(hipblasLtMatmul(handle,
