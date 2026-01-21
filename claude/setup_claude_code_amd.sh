@@ -1,4 +1,7 @@
+## export AMD_LLM_API_KEY=<API KEY> before sourcing this script
 curl -fsSL https://claude.ai/install.sh | bash -s latest
+
+export PATH="$HOME/.local/bin:$PATH"
 
 export ANTHROPIC_API_KEY="dummy"
 export ANTHROPIC_BASE_URL="https://llm-api.amd.com/Anthropic"
